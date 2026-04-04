@@ -1,0 +1,315 @@
+name: Self-Healing CI Pipeline
+
+on:
+#   push:
+#     branches: [ main, master ]
+#   pull_request:
+#     branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  build-and-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Bazel
+        uses: bazelbuild/setup-bazelisk@v2
+      
+      - name: Build all targets
+        run: bazel build //...
+        continue-on-error: false
+      
+      - name: Run tests
+        id: test
+        run: |
+          bazel test //... --test_output=all 2>&1 | tee test_output.log
+        continue-on-error: true
+      
+      - name: Capture test results
+        if: always()
+        run: |
+          echo "Test exit code: ${{ steps.test.outcome }}"
+          
+          # Collect Bazel test logs
+          mkdir -p test-logs
+          
+          # Find and copy test logs
+          find bazel-testlogs -name "test.log" -exec cp {} test-logs/ \; 2>/dev/null || true
+          find bazel-testlogs -name "test.xml" -exec cp {} test-logs/ \; 2>/dev/null || true
+          
+          # Copy the full test output
+          cp test_output.log test-logs/ 2>/dev/null || true
+          
+          # List what we captured
+          echo "Captured logs:"
+          ls -la test-logs/
+          
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-logs
+          path: |
+            test-logs/
+            test_output.log
+          retention-days: 5
+      
+      - name: Set failure flag
+        if: failure()
+        run: echo "TESTS_FAILED=true" >> $GITHUB_ENV
+
+  self-heal:
+    name: AI-Powered Self-Healing Job
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    if: failure()
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download test logs
+        uses: actions/download-artifact@v3
+        with:
+          name: test-logs
+          path: test-logs
+
+      - name: Fetch Error Context
+        id: context
+        run: |
+          echo "=== Gathering error context ==="
+          
+          # Combine all available error logs
+          ERROR_CONTEXT=""
+          
+          # Get test output logs
+          if [ -f test-logs/test_output.log ]; then
+            echo "Found test output log"
+            ERROR_CONTEXT=$(cat test-logs/test_output.log | tail -n 200)
+          fi
+          
+          # Get workflow logs via GitHub API
+          echo "Fetching workflow run logs..."
+          WORKFLOW_LOGS=$(gh run view ${{ github.run_id }} --log 2>/dev/null | tail -n 100 || echo "")
+          
+          # Combine all logs
+          COMBINED_LOGS=$(printf "%s\n\n%s" "$ERROR_CONTEXT" "$WORKFLOW_LOGS")
+          
+          # Escape for JSON and store
+          ESCAPED_LOGS=$(echo "$COMBINED_LOGS" | python3 -c "import json,sys; print(json.dumps(sys.stdin.read()))")
+          echo "error_logs=$ESCAPED_LOGS" >> $GITHUB_ENV
+          
+          echo "=== Error context captured ==="
+          echo "$COMBINED_LOGS" | head -n 50
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get relevant source files
+        id: source_files
+        run: |
+          echo "=== Collecting source files for context ==="
+          
+          # Collect all C++ and Python files (limit to reasonable size)
+          SOURCE_FILES=""
+          
+          for file in $(find core tests -type f \( -name "*.cpp" -o -name "*.h" -o -name "*.py" \) 2>/dev/null); do
+            if [ -f "$file" ]; then
+              echo "Including: $file"
+              FILE_CONTENT=$(cat "$file")
+              SOURCE_FILES="${SOURCE_FILES}\n\n--- FILE: $file ---\n${FILE_CONTENT}"
+            fi
+          done
+          
+          # Escape for JSON
+          ESCAPED_SOURCE=$(echo -e "$SOURCE_FILES" | python3 -c "import json,sys; print(json.dumps(sys.stdin.read()))")
+          echo "source_files=$ESCAPED_SOURCE" >> $GITHUB_ENV
+
+      - name: GitHub Copilot Inference Fix
+        id: ai_fix
+        env:
+          COPILOT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== Calling GitHub Copilot API for fix generation ==="
+          
+          # Prepare the prompt with error logs and source files
+          cat > prompt.json << EOF
+          {
+            "model": "gpt-4o",
+            "messages": [
+              {
+                "role": "system",
+                "content": "You are an expert CI/CD and software engineering assistant. Analyze the provided error logs and source code, identify the root cause, and generate a complete fix. You must return ONLY valid JSON matching the exact schema provided. The 'new_content' field must contain the COMPLETE fixed file content, not just a patch or diff."
+              },
+              {
+                "role": "user",
+                "content": "## Error Logs:\n${{ env.error_logs }}\n\n## Source Files:\n${{ env.source_files }}\n\n## Task:\nAnalyze the error, identify which file needs to be fixed, and provide the complete corrected file content. Return ONLY a JSON object with: explanation, file_to_fix, new_content, issue_title."
+              }
+            ],
+            "response_format": {
+              "type": "json_schema",
+              "json_schema": {
+                "name": "fix_schema",
+                "strict": true,
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "explanation": {
+                      "type": "string",
+                      "description": "Detailed explanation of the root cause and the fix"
+                    },
+                    "file_to_fix": {
+                      "type": "string",
+                      "description": "Relative path to the file that needs to be fixed"
+                    },
+                    "new_content": {
+                      "type": "string",
+                      "description": "Complete new content for the file"
+                    },
+                    "issue_title": {
+                      "type": "string",
+                      "description": "Short title for the GitHub issue and PR"
+                    }
+                  },
+                  "required": ["explanation", "file_to_fix", "new_content", "issue_title"],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+          EOF
+          
+          # Call GitHub Copilot API
+          RESPONSE=$(curl -s -L -X POST "https://api.githubcopilot.com/chat/completions" \
+            -H "Accept: application/json" \
+            -H "Authorization: Bearer $COPILOT_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d @prompt.json)
+          
+          echo "API Response received"
+          echo "$RESPONSE" | jq '.' || echo "Response is not valid JSON"
+          
+          # Extract the JSON content from the LLM response
+          echo "$RESPONSE" | jq -r '.choices[0].message.content // .error // "No response"' > fix_payload.json
+          
+          # Validate the fix payload
+          if jq -e '.file_to_fix and .new_content and .issue_title and .explanation' fix_payload.json > /dev/null 2>&1; then
+            echo "✅ Valid fix payload received"
+            cat fix_payload.json | jq '.'
+          else
+            echo "❌ Invalid fix payload, falling back to manual review"
+            echo '{"issue_title": "CI Failure - Manual Review Required", "explanation": "The AI was unable to generate an automatic fix. Please review the error logs manually.", "file_to_fix": "MANUAL_REVIEW", "new_content": ""}' > fix_payload.json
+          fi
+
+      - name: Apply Fix, Create Issue & PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== Processing AI-generated fix ==="
+          
+          # Parse AI payload
+          TITLE=$(jq -r '.issue_title' fix_payload.json)
+          EXPLANATION=$(jq -r '.explanation' fix_payload.json)
+          FILE=$(jq -r '.file_to_fix' fix_payload.json)
+          CONTENT=$(jq -r '.new_content' fix_payload.json)
+          
+          echo "Title: $TITLE"
+          echo "File to fix: $FILE"
+          echo "Explanation: $EXPLANATION"
+          
+          # Check if manual review is needed
+          if [ "$FILE" = "MANUAL_REVIEW" ]; then
+            echo "⚠️ Manual review required - creating issue only"
+            gh issue create \
+              --title "$TITLE" \
+              --body "## Automated Analysis Failed\n\n$EXPLANATION\n\n### Error Logs\n\`\`\`\n$(cat test-logs/test_output.log | head -n 100)\n\`\`\`\n\n**Workflow Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+              --label "automated-fix,needs-review"
+            exit 0
+          fi
+          
+          # 1. Create the Issue
+          echo "Creating GitHub issue..."
+          ISSUE_URL=$(gh issue create \
+            --title "$TITLE" \
+            --body "## Automated Fix Proposed\n\n### Root Cause Analysis\n$EXPLANATION\n\n### File to Fix\n\`$FILE\`\n\n### Actions Taken\n- ✅ Issue created\n- ✅ Fix generated by AI\n- ✅ PR will be created automatically\n\n**Workflow Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --label "automated-fix")
+          
+          echo "✅ Created issue: $ISSUE_URL"
+          ISSUE_NUMBER=$(echo "$ISSUE_URL" | grep -oP '\d+$')
+
+          # 2. Create a Fix Branch
+          BRANCH_NAME="fix/ci-auto-heal-${{ github.run_id }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH_NAME"
+          
+          # 3. Apply the fix to the file
+          echo "Applying fix to $FILE..."
+          echo "$CONTENT" > "$FILE"
+          
+          # Show what changed
+          echo "=== Changes to be committed ==="
+          git diff "$FILE" || echo "File is new or binary"
+          
+          git add "$FILE"
+          git commit -m "fix: automated CI failure fix (Issue #$ISSUE_NUMBER)
+
+          $EXPLANATION
+
+          This fix was automatically generated by the Self-Healing CI Pipeline
+          using GitHub Copilot AI analysis.
+
+          Closes #$ISSUE_NUMBER"
+          
+          git push origin "$BRANCH_NAME"
+
+          # 4. Create the PR
+          echo "Creating pull request..."
+          gh pr create \
+            --title "🤖 $TITLE" \
+            --body "## Automated Fix Generated by Self-Healing CI
+
+          ### Root Cause Analysis
+          $EXPLANATION
+
+          ### File Modified
+          \`$FILE\`
+
+          ### How This Fix Was Generated
+          1. ✅ CI detected test failure
+          2. ✅ Error logs collected and analyzed
+          3. ✅ GitHub Copilot AI generated fix
+          4. ✅ Fix applied automatically
+          
+          ### Related Issue
+          Closes $ISSUE_URL
+
+          ### Review Checklist
+          - [ ] Review the code changes
+          - [ ] Verify the fix addresses the root cause
+          - [ ] Check for any potential side effects
+          - [ ] Run additional tests if needed
+
+          ---
+          **Generated by:** Self-Healing CI Pipeline  
+          **Workflow Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}  
+          **AI Model:** GitHub Copilot (GPT-4o)
+          " \
+            --base ${{ github.ref_name }} \
+            --head "$BRANCH_NAME" \
+            --label "automated-fix"
+          
+          echo "✅ Pull request created successfully!"
